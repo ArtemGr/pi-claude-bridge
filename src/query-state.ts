@@ -128,6 +128,8 @@ export class QueryContext {
 	/** API message id of the non-streaming fallback being delivered from `assistant`
 	 *  messages. The SDK hands it over one block per message, all under this id. */
 	turnFallbackMessageId: string | undefined;
+	/** Max `cache_creation_input_tokens` seen per API message id in this turn, so retries/errors keep billed writes. */
+	turnCacheWrites = new Map<string, number>();
 
 	get turnBlocks(): Array<any> {
 		if (!this.turnOutput) throw new Error("turnBlocks accessed before resetTurnState");
@@ -157,6 +159,7 @@ export class QueryContext {
 		this.turnStreamOpen = false;
 		this.turnStreamBlockStart = 0;
 		this.turnFallbackMessageId = undefined;
+		this.turnCacheWrites.clear();
 		// turnToolCallIds is NOT reset — it persists across tool-result delivery
 		// callbacks within the same assistant message so results can be routed to
 		// this query while its handlers are still pending.

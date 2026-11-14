@@ -25,7 +25,7 @@ import { collectCarriedAttachments } from "./attachments.js";
 import { createToolServer } from "./mcp-server.js";
 import { nonSystemMessages, toBridgeContext } from "./transcript.js";
 import { forgetSessionCwd, rememberSessionCwd, rememberSummarySession, sessionCwdFor, summarySessionFor } from "./session-cwd.js";
-import { updateUsage, type SdkUsage } from "./usage.js";
+import { ensureMinCacheWrite, updateUsage, type SdkUsage } from "./usage.js";
 import { rateLimitResponse } from "./rate-limit.js";
 import { BRIDGE_VERSION, packageVersion, setTraceNotifier, traceAssertReady, traceEvent, traceId, traceInput, traceQueryStart, traceSignalId, traceSnapshot, traceStrict } from "./cache-trace.js";
 import { DEBUG, debug, makeCliDebugOptions, moduleInstanceId } from "./debug.js";
@@ -909,16 +909,39 @@ function sessionTag(piSessionId: string | null | undefined): string {
 // The counter mapping lives in usage.ts; the debug line is this side's job, so every
 // call site logs the same way rather than three times over.
 function recordUsage(output: AssistantMessage, usage: SdkUsage, model: Model<any>, piSessionId: string | null,
-	source = "?", apiMessageId: string | undefined = undefined, queryId: string | undefined = undefined): void {
+	source = "?", apiMessageId: string | undefined = undefined, queryId: string | undefined = undefined,
+	c: QueryContext | undefined = undefined): void {
 	// The 5m/1h split shows which TTL each cache write is billed at (a 1h write costs 2x input, a 5m write 1.25x).
 	const split = (usage as any).cache_creation as { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number } | undefined;
 	usageTrace("usage", {
 		source, apiMessageId: apiMessageId ?? null, queryId: queryId ?? null, piSessionId,
 		write5m: split?.ephemeral_5m_input_tokens ?? null, write1h: split?.ephemeral_1h_input_tokens ?? null, raw: usage,
 	});
+	if (source !== "synthetic" && c) {
+		const rawIters = (usage as any).iterations;
+		const iters = Array.isArray(rawIters) ? rawIters as Array<{ cache_creation_input_tokens?: number }> : [];
+		const iterWrite = iters.reduce((sum, it) => sum + (it?.cache_creation_input_tokens ?? 0), 0);
+		const writeTokens = Math.max(usage.cache_creation_input_tokens ?? 0, iterWrite);
+		if (0 < writeTokens) {
+			const key = apiMessageId ?? source;
+			c.turnCacheWrites.set(key, Math.max(c.turnCacheWrites.get(key) ?? 0, writeTokens));
+		}
+	}
+	// CC's `<synthetic>` failure report carries an all-zero usage struct; keep any real API usage this turn billed.
+	const frameTotal = (usage.input_tokens ?? 0) + (usage.output_tokens ?? 0)
+		+ (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0);
+	if (source === "synthetic" && frameTotal === 0 && 0 < output.usage.totalTokens) return;
 	const { cachePct, reasoning } = updateUsage(output, usage, model);
 	const reasoningText = reasoning == null ? "" : ` reasoning=${reasoning}`;
 	debug(`usage: in=${output.usage.input} out=${output.usage.output} cacheRead=${output.usage.cacheRead} cacheWrite=${output.usage.cacheWrite} total=${output.usage.totalTokens}${reasoningText} cachePct=${cachePct}% model=${model.id} ${sessionTag(piSessionId)}`);
+}
+
+/** Preserve all cache writes billed across retried/failed API calls in the current turn. */
+function preserveTurnWritesOnFailure(c: QueryContext, model: Model<any>): void {
+	if (!c.turnOutput || !c.turnCacheWrites.size) return;
+	let totalWrite = 0;
+	for (const w of c.turnCacheWrites.values()) totalWrite += w;
+	ensureMinCacheWrite(c.turnOutput, totalWrite, model);
 }
 
 // Log the *served* context window reported by an SDK result message
@@ -1170,7 +1193,10 @@ function processStreamEvent(
 		if (c.turnStreamMessageId && !c.turnAssistantIds.includes(c.turnStreamMessageId)) c.turnAssistantIds.push(c.turnStreamMessageId);
 		c.turnStreamOpen = true;
 		c.turnStreamBlockStart = c.turnBlocks.length;
-		if (event.message?.usage) recordUsage(c.turnOutput, event.message.usage, model, c.piSessionId, "message_start", event.message?.id, usageQueryId(c));
+		if (event.message?.usage) {
+			recordUsage(c.turnOutput, event.message.usage, model, c.piSessionId,
+				"message_start", event.message?.id, usageQueryId(c), c);
+		}
 		return;
 	}
 
@@ -1253,7 +1279,10 @@ function processStreamEvent(
 
 	if (event?.type === "message_delta") {
 		c.turnOutput.stopReason = mapStopReason(event.delta?.stop_reason);
-		if (event.usage) recordUsage(c.turnOutput, event.usage, model, c.piSessionId, "message_delta", c.turnStreamMessageId, usageQueryId(c));
+		if (event.usage) {
+			recordUsage(c.turnOutput, event.usage, model, c.piSessionId,
+				"message_delta", c.turnStreamMessageId, usageQueryId(c), c);
+		}
 		return;
 	}
 
@@ -1355,7 +1384,10 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 			if (block.type === "text" && block.text) c.turnBlocks.push({ type: "text", text: block.text });
 			else debug("processAssistantMessage: unhandled <synthetic> block type", block.type);
 		}
-		if (assistantMsg.usage && c.turnOutput) recordUsage(c.turnOutput, assistantMsg.usage, model, c.piSessionId, "synthetic", assistantMsg.id, usageQueryId(c));
+		if (assistantMsg.usage && c.turnOutput) {
+			recordUsage(c.turnOutput, assistantMsg.usage, model, c.piSessionId,
+				"synthetic", assistantMsg.id, usageQueryId(c), c);
+		}
 		return;
 	}
 	const id = assistantMsg.id;
@@ -1406,7 +1438,10 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 			debug("processAssistantMessage: unhandled block type", block.type);
 		}
 	}
-	if (assistantMsg.usage && c.turnOutput) recordUsage(c.turnOutput, assistantMsg.usage, model, c.piSessionId, "assistant-fallback", assistantMsg.id, usageQueryId(c));
+	if (assistantMsg.usage && c.turnOutput) {
+		recordUsage(c.turnOutput, assistantMsg.usage, model, c.piSessionId,
+			"assistant-fallback", assistantMsg.id, usageQueryId(c), c);
+	}
 
 	// End the stream on tool_use, same as processStreamEvent's message_stop handler.
 	if (c.turnSawToolCall && c.currentPiStream && c.turnOutput) endToolUseTurn(c);
@@ -1429,6 +1464,88 @@ function toolCallRejection(message: SDKMessage, c: QueryContext): { toolCallId: 
 	if (call?.type !== "toolCall") throw new Error(`Claude Code answered tool call ${id}, but its assistant message never arrived`);
 	const reason = typeof block.content === "string" ? block.content : (block.content ?? []).map((b) => (b.type === "text" ? b.text : "")).join("");
 	return { toolCallId: id, describe: (when) => `Claude Code rejected pi's tool call "${call.name}" ${when}. Claude Code said: ${JSON.stringify(reason.trim())}` };
+}
+
+function canonicalClaudeModelId(id: string): string {
+	return id.trim().toLowerCase().replace(/\[1m\]$/, "").replace(/-\d{8}$/, "");
+}
+
+function isMismatchedClaudeModel(served: unknown, requested: string): served is string {
+	if (typeof served !== "string" || !served || served === "<synthetic>") return false;
+	const want = canonicalClaudeModelId(requested);
+	const got = canonicalClaudeModelId(served);
+	return want.startsWith("claude-") && got.startsWith("claude-") && got !== want;
+}
+
+function formatRefusalDetails(category: unknown, explanation: unknown): string {
+	const parts: string[] = [];
+	if (typeof category === "string" && category) parts.push(`category=${category}`);
+	if (typeof explanation === "string" && explanation.trim()) parts.push(explanation.trim());
+	return parts.length ? `: ${parts.join(" — ")}` : "";
+}
+
+/** Detect a main-thread safeguard refusal or silent model swap so consumeQuery aborts immediately. */
+function detectFallbackOrRefusal(message: SDKMessage, model: Model<any>): string | undefined {
+	if ("parent_tool_use_id" in message && message.parent_tool_use_id !== null) return undefined;
+	if (message.type === "system") {
+		const m = message as any;
+		const sub = m.subtype as string | undefined;
+		const orig = m.original_model ?? model.id;
+		const dest = m.fallback_model ?? "?";
+		if (sub === "model_refusal_fallback") {
+			const detail = formatRefusalDetails(m.api_refusal_category, m.api_refusal_explanation || m.content);
+			return `Claude bridge aborted refusal fallback (${orig} -> ${dest})${detail}`;
+		}
+		if (sub === "model_refusal_no_fallback") {
+			const detail = formatRefusalDetails(m.api_refusal_category, m.api_refusal_explanation || m.content);
+			return `Claude bridge aborted on safeguard refusal (${orig})${detail}`;
+		}
+		if (sub === "model_fallback" || sub === "model_consent_fallback") {
+			return `Claude bridge aborted model fallback (${orig} -> ${dest}, trigger=${m.trigger ?? sub})`;
+		}
+		return undefined;
+	}
+	if (message.type === "stream_event") {
+		const event = (message as any).event;
+		if (event?.type === "message_start" && isMismatchedClaudeModel(event.message?.model, model.id)) {
+			return `Claude bridge aborted model fallback: requested ${model.id}, served ${event.message.model}`;
+		}
+		if (event?.type === "content_block_start" && event.content_block?.type === "fallback") {
+			const fb = event.content_block;
+			const detail = formatRefusalDetails(fb.trigger?.category, undefined);
+			const pair = `${fb.from?.model ?? model.id} -> ${fb.to?.model ?? "?"}`;
+			return `Claude bridge aborted refusal fallback (${pair})${detail}`;
+		}
+		if (event?.type === "message_delta") {
+			if (event.delta?.stop_reason === "refusal") {
+				const sd = event.delta.stop_details;
+				const detail = formatRefusalDetails(sd?.category, sd?.explanation);
+				return `Claude bridge aborted on safeguard refusal (${model.id})${detail}`;
+			}
+			const fb = Array.isArray(event.usage?.iterations)
+				? event.usage.iterations.find((it: any) => it?.type === "fallback_message")
+				: undefined;
+			if (fb) return `Claude bridge aborted model fallback (${model.id} -> ${fb.model ?? "fallback_message"})`;
+		}
+		return undefined;
+	}
+	if (message.type === "assistant") {
+		const assistantMsg = (message as any).message;
+		if (!assistantMsg || assistantMsg.model === "<synthetic>") return undefined;
+		if (assistantMsg.stop_reason === "refusal") {
+			const sd = assistantMsg.stop_details;
+			const detail = formatRefusalDetails(sd?.category, sd?.explanation);
+			return `Claude bridge aborted on safeguard refusal (${model.id})${detail}`;
+		}
+		const fb = Array.isArray(assistantMsg.usage?.iterations)
+			? assistantMsg.usage.iterations.find((it: any) => it?.type === "fallback_message")
+			: undefined;
+		if (fb) return `Claude bridge aborted model fallback (${model.id} -> ${fb.model ?? "fallback_message"})`;
+		if (isMismatchedClaudeModel(assistantMsg.model, model.id)) {
+			return `Claude bridge aborted model fallback: requested ${model.id}, served ${assistantMsg.model}`;
+		}
+	}
+	return undefined;
 }
 
 /** Background consumer: iterates the SDK generator, pushing events to currentPiStream.
@@ -1500,6 +1617,39 @@ async function consumeQuery(
 			const started = (message as any).event.message;
 			traceEvent("api-message", { queryId: traceQueryId, apiMessageId: started?.id ?? null, model: started?.model ?? null, usage: started?.usage ?? null });
 		}
+		const abortReason = detectFallbackOrRefusal(message, model);
+		if (abortReason !== undefined) {
+			const qid = usageQueryId(queryCtx);
+			if (queryCtx.turnOutput) {
+				if (message.type === "stream_event") {
+					const ev = (message as any).event;
+					if (ev?.type === "message_start" && ev.message?.usage) {
+						recordUsage(queryCtx.turnOutput, ev.message.usage, model,
+							queryCtx.piSessionId, "message_start", ev.message.id, qid, queryCtx);
+					} else if (ev?.type === "message_delta" && ev.usage) {
+						recordUsage(queryCtx.turnOutput, ev.usage, model,
+							queryCtx.piSessionId, "message_delta", queryCtx.turnStreamMessageId, qid, queryCtx);
+					}
+				} else if (message.type === "assistant" && (message as any).message?.usage) {
+					const am = (message as any).message;
+					recordUsage(queryCtx.turnOutput, am.usage, model,
+						queryCtx.piSessionId, "assistant-abort", am.id, qid, queryCtx);
+				}
+			}
+			preserveTurnWritesOnFailure(queryCtx, model);
+			usageTrace("fallback-abort", {
+				queryId: qid, piSessionId: queryCtx.piSessionId, reason: abortReason,
+			});
+			piUI?.notify(abortReason, "warning");
+			if (queryCtx.turnOutput && queryCtx.currentPiStream) {
+				queryCtx.turnOutput.stopReason = "error";
+				queryCtx.turnOutput.errorMessage = abortReason;
+			}
+			queryCtx.promptStream?.end();
+			queryCtx.stopProcess?.();
+			failure = new Error(abortReason);
+			break;
+		}
 		let resultError: string | undefined;
 		if (message.type === "result") {
 			queryCtx.sawResult = true;
@@ -1515,6 +1665,10 @@ async function consumeQuery(
 			// can still start a later turn.
 			if (resultError !== undefined || queryCtx.pendingSteerUuids.size === 0) queryCtx.promptStream?.end();
 			if (resultError !== undefined) {
+				if (queryCtx.turnOutput && queryCtx.turnOutput.usage.totalTokens === 0 && (message as any).usage) {
+					recordUsage(queryCtx.turnOutput, (message as any).usage, model,
+						queryCtx.piSessionId, "result-error", undefined, usageQueryId(queryCtx), queryCtx);
+				}
 				// Consume the rejection alongside the failure it caused, so a later
 				// unrelated failure on this query doesn't inherit the label.
 				if (queryCtx.rateLimitRejection) {
@@ -2219,6 +2373,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			activeQueryContexts.delete(queryCtx);
 			traceEvent("query-end", { queryId: traceQueryId, outcome: wasAborted ? "aborted" : "error", error: errorMessage(error) });
 			if (queryCtx.turnOutput && queryCtx.currentPiStream) {
+				preserveTurnWritesOnFailure(queryCtx, model);
 				queryCtx.turnOutput.stopReason = wasAborted ? "aborted" : "error";
 				queryCtx.turnOutput.errorMessage ??= errorMessage(error);
 				endCurrentPiStream(queryCtx, { type: "error", reason: wasAborted ? "aborted" : "error", error: queryCtx.turnOutput });

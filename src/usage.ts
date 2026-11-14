@@ -51,3 +51,12 @@ export function updateUsage(output: AssistantMessage, usage: SdkUsage, model: Mo
 	if (reasoning != null) report.reasoning = reasoning;
 	return report;
 }
+
+/** Floor `output.usage.cacheWrite` at `minCacheWrite` so a failed/retried turn never loses billed writes. */
+export function ensureMinCacheWrite(output: AssistantMessage, minCacheWrite: number, model: Model<Api>): void {
+	if (!(output.usage.cacheWrite < minCacheWrite)) return;
+	output.usage.cacheWrite = minCacheWrite;
+	const u = output.usage;
+	u.totalTokens = u.input + u.output + u.cacheRead + u.cacheWrite;
+	calculateCost(model, u);
+}
