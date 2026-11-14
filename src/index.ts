@@ -2138,6 +2138,11 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			stopWriting();
 			// Costs the next turn a prefix-write; diag/audit-cache.mjs fails on it.
 			if (!dirty && (recording.hasGaps || (syncResult.created && !recording.hasProgress))) debug(`recording: clean end left messages unrecorded ${sessionTag(piSessionId)}`);
+			usageTrace("commit", {
+				queryId: usageQueryId(queryCtx), piSessionId, dirty, created: syncResult.created, target: syncResult.targetSessionId,
+				hasProgress: recording.hasProgress, hasGaps: recording.hasGaps, recorded: recording.recorded.digests.length,
+				stateReplaced: piSessionId != null && sessionStateFor(piSessionId) !== expectedState,
+			});
 			if (piSessionId == null || sessionStateFor(piSessionId) !== expectedState || (syncResult.created && !recording.hasProgress)) return;
 			const state: SessionState = { ...copyRecording(recording.recorded), ccSessionId: syncResult.targetSessionId, cwd, model: cliModel, promptDigest,
 				dirtyTail: dirty || queryCtx.historyStale || recording.hasGaps };
@@ -2268,7 +2273,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				stopWriting();
 				try { await persistRecording(); }
 				finally {
-					if (syncResult.created && !recording.hasProgress) deleteSession(syncResult.targetSessionId, cwd, process.env.CLAUDE_CONFIG_DIR);
+					if (syncResult.created && !recording.hasProgress) {
+						usageTrace("delete-session", { queryId: usageQueryId(queryCtx), piSessionId, target: syncResult.targetSessionId });
+						deleteSession(syncResult.targetSessionId, cwd, process.env.CLAUDE_CONFIG_DIR);
+					}
 					releaseWriter();
 				}
 			});
