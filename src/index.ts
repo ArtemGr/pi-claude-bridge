@@ -910,7 +910,12 @@ function sessionTag(piSessionId: string | null | undefined): string {
 // call site logs the same way rather than three times over.
 function recordUsage(output: AssistantMessage, usage: SdkUsage, model: Model<any>, piSessionId: string | null,
 	source = "?", apiMessageId: string | undefined = undefined, queryId: string | undefined = undefined): void {
-	usageTrace("usage", { source, apiMessageId: apiMessageId ?? null, queryId: queryId ?? null, piSessionId, raw: usage });
+	// The 5m/1h split shows which TTL each cache write is billed at (a 1h write costs 2x input, a 5m write 1.25x).
+	const split = (usage as any).cache_creation as { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number } | undefined;
+	usageTrace("usage", {
+		source, apiMessageId: apiMessageId ?? null, queryId: queryId ?? null, piSessionId,
+		write5m: split?.ephemeral_5m_input_tokens ?? null, write1h: split?.ephemeral_1h_input_tokens ?? null, raw: usage,
+	});
 	const { cachePct, reasoning } = updateUsage(output, usage, model);
 	const reasoningText = reasoning == null ? "" : ` reasoning=${reasoning}`;
 	debug(`usage: in=${output.usage.input} out=${output.usage.output} cacheRead=${output.usage.cacheRead} cacheWrite=${output.usage.cacheWrite} total=${output.usage.totalTokens}${reasoningText} cachePct=${cachePct}% model=${model.id} ${sessionTag(piSessionId)}`);
