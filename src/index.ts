@@ -29,6 +29,31 @@ import { updateUsage, type SdkUsage } from "./usage.js";
 import { rateLimitResponse } from "./rate-limit.js";
 import { BRIDGE_VERSION, packageVersion, setTraceNotifier, traceAssertReady, traceEvent, traceId, traceInput, traceQueryStart, traceSignalId, traceSnapshot, traceStrict } from "./cache-trace.js";
 import { DEBUG, debug, makeCliDebugOptions, moduleInstanceId } from "./debug.js";
+
+// Local tracing for the cache-rewrite / misreported-usage investigation: always on, because a
+// quota-capped window leaves too few turns to rerun with env flags. CLAUDE_BRIDGE_USAGE_TRACE overrides the path.
+const USAGE_TRACE_PATH = process.env.CLAUDE_BRIDGE_USAGE_TRACE ?? "/dev/shm/bridge-trace.log";
+const usageQueryIds = new WeakMap<object, string>();
+let usageSeq = 0;
+/** A per-query id for usageTrace; traceQueryId is undefined unless CLAUDE_BRIDGE_TRACE_DIR is set. */
+function usageQueryId(c: object): string {
+	let id = usageQueryIds.get(c);
+	if (!id) usageQueryIds.set(c, id = `q${++usageSeq}`);
+	return id;
+}
+/** Role and block shapes of a message, enough to see what changed without logging its text. */
+function messageShape(message: { role: string; content?: unknown } | undefined): unknown {
+	if (!message) return null;
+	const content = Array.isArray(message.content)
+		? message.content.map((b: any) => `${b.type}:${(b.text ?? b.thinking ?? b.data ?? JSON.stringify(b.arguments ?? "")).length}`
+			+ (b.type === "thinking" ? `:sig${(b.thinkingSignature ?? "").length}` : "") + (b.id ? `:${b.id}` : ""))
+		: typeof message.content === "string" ? `string:${message.content.length}` : typeof message.content;
+	return { role: message.role, content, provider: (message as any).provider ?? null };
+}
+function usageTrace(kind: string, fields: Record<string, unknown>): void {
+	try { appendFileSync(USAGE_TRACE_PATH, `${JSON.stringify({ t: new Date().toISOString(), kind, ...fields })}\n`); }
+	catch (error) { debug(`usageTrace: append failed:`, error); }
+}
 import { CC_CHILD_ENV, ccChildEnv, CLAUDE_MD_EXCLUDES, errorMessage, REASONING_TO_EFFORT, resultErrorText } from "./cc-child.js";
 
 /** Unconditional diagnostic dump — for "should never happen" paths. Creates pi's agent
@@ -156,6 +181,7 @@ const markRebuildHooks: Set<MarkRebuildHook> =
  *  is never null from an event handler (each pi session has its own runner);
  *  a null one marks nothing, since an unattributed caller has no mirror. */
 function markRebuildForSession(piSession: string | null, event: string): void {
+	usageTrace("mark-rebuild", { piSession, event, hasState: piSession != null && sharedSessions.has(piSession) });
 	// The rewriting session's own mirror: the rewrite changed the history it was
 	// built from, so its next sync must REBUILD rather than REUSE. Every other
 	// session's mirror stays untouched — its conversation was never rewritten.
@@ -596,6 +622,13 @@ function syncSharedSession(
 		: state.model !== modelId ? "model-changed" : promptChanged ? "prompt-changed" : cwdChanged ? "cwd-changed"
 		: row === 4 ? "equal-digests" : state.dirtyTail && compared.equal ? "dirty-tail" : "history-difference";
 	const decision = (path: string, after: string) => {
+		usageTrace("sync-decision", {
+			piSessionId: piSessionId ?? null, row, path, reason, commonPrefix: compared.commonPrefix, cutCount: compared.cutCount,
+			priors: priors.length, recorded: state?.digests.length ?? null, dirtyTail: Boolean(state?.dirtyTail), missingFile,
+			stateModel: state?.model ?? null, modelId, promptChanged, cwdChanged, ccSessionBefore: before?.ccSessionId ?? null,
+			ccSessionAfter: after,
+			firstDiff: compared.commonPrefix < priors.length ? messageShape(priors[compared.commonPrefix]) : null,
+		});
 		traceStrict("decision", {
 			callId: traceCallId, piSessionId: piSessionId ?? null, row, path, reason,
 			commonPrefix: compared.commonPrefix, cutCount: compared.cutCount,
@@ -875,7 +908,9 @@ function sessionTag(piSessionId: string | null | undefined): string {
 
 // The counter mapping lives in usage.ts; the debug line is this side's job, so every
 // call site logs the same way rather than three times over.
-function recordUsage(output: AssistantMessage, usage: SdkUsage, model: Model<any>, piSessionId: string | null): void {
+function recordUsage(output: AssistantMessage, usage: SdkUsage, model: Model<any>, piSessionId: string | null,
+	source = "?", apiMessageId: string | undefined = undefined, queryId: string | undefined = undefined): void {
+	usageTrace("usage", { source, apiMessageId: apiMessageId ?? null, queryId: queryId ?? null, piSessionId, raw: usage });
 	const { cachePct, reasoning } = updateUsage(output, usage, model);
 	const reasoningText = reasoning == null ? "" : ` reasoning=${reasoning}`;
 	debug(`usage: in=${output.usage.input} out=${output.usage.output} cacheRead=${output.usage.cacheRead} cacheWrite=${output.usage.cacheWrite} total=${output.usage.totalTokens}${reasoningText} cachePct=${cachePct}% model=${model.id} ${sessionTag(piSessionId)}`);
@@ -1130,7 +1165,7 @@ function processStreamEvent(
 		if (c.turnStreamMessageId && !c.turnAssistantIds.includes(c.turnStreamMessageId)) c.turnAssistantIds.push(c.turnStreamMessageId);
 		c.turnStreamOpen = true;
 		c.turnStreamBlockStart = c.turnBlocks.length;
-		if (event.message?.usage) recordUsage(c.turnOutput, event.message.usage, model, c.piSessionId);
+		if (event.message?.usage) recordUsage(c.turnOutput, event.message.usage, model, c.piSessionId, "message_start", event.message?.id, usageQueryId(c));
 		return;
 	}
 
@@ -1213,7 +1248,7 @@ function processStreamEvent(
 
 	if (event?.type === "message_delta") {
 		c.turnOutput.stopReason = mapStopReason(event.delta?.stop_reason);
-		if (event.usage) recordUsage(c.turnOutput, event.usage, model, c.piSessionId);
+		if (event.usage) recordUsage(c.turnOutput, event.usage, model, c.piSessionId, "message_delta", c.turnStreamMessageId, usageQueryId(c));
 		return;
 	}
 
@@ -1315,7 +1350,7 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 			if (block.type === "text" && block.text) c.turnBlocks.push({ type: "text", text: block.text });
 			else debug("processAssistantMessage: unhandled <synthetic> block type", block.type);
 		}
-		if (assistantMsg.usage && c.turnOutput) recordUsage(c.turnOutput, assistantMsg.usage, model, c.piSessionId);
+		if (assistantMsg.usage && c.turnOutput) recordUsage(c.turnOutput, assistantMsg.usage, model, c.piSessionId, "synthetic", assistantMsg.id, usageQueryId(c));
 		return;
 	}
 	const id = assistantMsg.id;
@@ -1366,7 +1401,7 @@ function processAssistantMessage(message: SDKMessage, model: Model<any>, customT
 			debug("processAssistantMessage: unhandled block type", block.type);
 		}
 	}
-	if (assistantMsg.usage && c.turnOutput) recordUsage(c.turnOutput, assistantMsg.usage, model, c.piSessionId);
+	if (assistantMsg.usage && c.turnOutput) recordUsage(c.turnOutput, assistantMsg.usage, model, c.piSessionId, "assistant-fallback", assistantMsg.id, usageQueryId(c));
 
 	// End the stream on tool_use, same as processStreamEvent's message_stop handler.
 	if (c.turnSawToolCall && c.currentPiStream && c.turnOutput) endToolUseTurn(c);
@@ -1463,6 +1498,11 @@ async function consumeQuery(
 		let resultError: string | undefined;
 		if (message.type === "result") {
 			queryCtx.sawResult = true;
+			usageTrace("query-result", {
+				queryId: usageQueryId(queryCtx), subtype: message.subtype, isError: (message as any).is_error ?? null,
+				ccSession: message.session_id, numTurns: (message as any).num_turns ?? null, usage: (message as any).usage ?? null,
+				modelUsage: (message as any).modelUsage ?? null,
+			});
 			traceEvent("query-result", { queryId: traceQueryId, subtype: message.subtype, isError: (message as any).is_error ?? null, ccSession: message.session_id, numTurns: (message as any).num_turns ?? null, usage: (message as any).usage ?? null });
 			logServedContextWindow("result", message, model);
 			resultError = resultErrorText(message);
@@ -1693,6 +1733,7 @@ const CONTINUE_AFTER_RESUME_PROMPT =
  *  history — so the turn continues instead of ending here. Nothing is lost by
  *  killing the subprocess: pi owns the only copy of the conversation that counts. */
 function discardRewrittenQuery(c: QueryContext): void {
+	usageTrace("discard", { queryId: usageQueryId(c), historyStale: c.historyStale, piSessionId: c.piSessionId });
 	// A failed commit reaches the caller, but never leaves the query parked.
 	try { c.commitRecording?.(true); }
 	finally { dropParkedQuery(c); }
@@ -1784,6 +1825,18 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		return failBeforeQuery(error);
 	}
 	const rewrittenUnderQuery = Boolean(resultCtx && (resultCtx.historyStale || divergence !== undefined));
+	{
+		const live = nonSystemMessages(context.messages);
+		usageTrace("provider-call", {
+			piSessionId: options?.sessionId ?? null, msgs: live.length, lastMsgRole, activeContexts: activeQueryContexts.size,
+			results: allResults.map((r) => r.toolCallId), resultQuery: resultCtx ? usageQueryId(resultCtx) : null,
+			historyStale: resultCtx?.historyStale ?? null, divergence: divergence ?? null,
+			recorded: resultCtx?.recording.recorded.digests.length ?? null,
+			divergedLive: typeof divergence === "number" ? messageShape(live[divergence]) : null,
+			divergedRecorded: typeof divergence === "number" ? resultCtx?.recording.recorded.digests[divergence] ?? "live-slot" : null,
+			divergedLiveDigest: typeof divergence === "number" && live[divergence] ? digestMessage(live[divergence]) : null,
+		});
+	}
 	if (resultCtx && rewrittenUnderQuery) {
 		traceEvent("route", {
 			callId: traceCallId, route: "discard-rewritten", queryId: resultCtx.traceQueryId,
@@ -1985,6 +2038,15 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		// also autocompact would double-flush the prompt cache and races pi's
 		// threshold with CC's, including CC's anti-thrashing guard (issue #8).
 		// Manual /compact in CC still works (we never invoke it).
+		usageTrace("query-start", {
+			queryId: usageQueryId(queryCtx), piSessionId, reentrant: isReentrant, resume: resumeSessionId ?? null,
+			target: syncResult.targetSessionId, created: syncResult.created, forkAt: syncResult.forkAt ?? null, model: cliModel,
+			effort: effort ?? null, msgs: context.messages.length, historyRewritten, unparkedToolResult,
+			promptDigest: promptDigest.slice(0, 12), appendChars: systemPromptAppend?.length ?? 0,
+			tools: createHash("sha256").update(JSON.stringify(mcpTools.map((t) => [t.name, t.description, t.parameters])))
+				.digest("hex").slice(0, 12),
+			prompt: promptText.slice(0, 80),
+		});
 		const childEnv = traceQueryStart(traceQueryId, {
 			kind: "provider", callId: traceCallId, piSessionId, reentrant: isReentrant, resume: resumeSessionId ?? null,
 			model: cliModel, effort: effort ?? null, servedToolNames: Object.fromEntries(customToolNameToSdk), mcpTools: mcpTools.map((t) => t.name),
