@@ -422,6 +422,12 @@ async function reportHeldRateLimit(c: QueryContext, model: Model<any>): Promise<
 }
 
 /** `context` must already be in bridge shape (toBridgeContext). */
+/** The SDK reports a dead child only as "Claude Code process exited with code N" (or "terminated by signal"),
+ *  so append what was run and its stderr, because a broken wrapper or missing binary is otherwise invisible. */
+function withExitDetails(message: string, child: QueryProcess | undefined): string {
+	return child && /Claude Code process (exited|terminated)/.test(message) ? message + child.describe() : message;
+}
+
 function isolatedStreamFn(model: Model<any>, context: Context, options?: SimpleStreamOptions, traceCallId?: string): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
 	void runIsolatedSummary(model, context, options, stream, traceCallId);
@@ -436,6 +442,7 @@ async function runIsolatedSummary(
 	traceCallId?: string,
 ): Promise<void> {
 	let sdkQuery: ReturnType<typeof query> | undefined;
+	let childProcess: QueryProcess | undefined;
 	let wasAborted = false;
 	const traceQueryId = traceId("summary");
 	const onAbort = () => {
@@ -455,7 +462,7 @@ async function runIsolatedSummary(
 		const thinking = thinkingForReasoning(model, options?.reasoning);
 		const cliDebug = makeCliDebugOptions("compact-summary");
 		// a custom spawn, as on the provider path, so the summary's Claude Code process is traced too
-		const childProcess = new QueryProcess(
+		childProcess = new QueryProcess(
 			cliDebug.stderr, spawnTrace({ source: "isolated-summary", queryId: traceQueryId, callId: traceCallId ?? null }));
 		debug(`compact summary: spawn model=${cliModel} registeredModel=${model.id} effort=${effort ?? "default"}${thinking ? " thinking=disabled" : ""} promptLen=${promptText.length}`);
 
@@ -532,7 +539,7 @@ async function runIsolatedSummary(
 		debug(`compact summary: done textLen=${text.length}`);
 		endStream(stream, { type: "done", reason: "stop", message: newAssistantOutput(model, text, "stop") });
 	} catch (err) {
-		const msg = errorMessage(err);
+		const msg = withExitDetails(errorMessage(err), childProcess);
 		debug("runIsolatedSummary threw; pushing terminal error", err);
 		endStream(stream, { type: "error", reason: "error", error: newAssistantOutput(model, "", "error", msg) });
 	} finally {
@@ -2417,11 +2424,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		const failStream = (error: unknown) => {
 			queryCtx.activeQuery = null;
 			activeQueryContexts.delete(queryCtx);
-			traceEvent("query-end", { queryId: traceQueryId, outcome: wasAborted ? "aborted" : "error", error: errorMessage(error) });
+			const message = withExitDetails(errorMessage(error), childProcess);
+			traceEvent("query-end", { queryId: traceQueryId, outcome: wasAborted ? "aborted" : "error", error: message });
 			if (queryCtx.turnOutput && queryCtx.currentPiStream) {
 				preserveTurnWritesOnFailure(queryCtx, model);
 				queryCtx.turnOutput.stopReason = wasAborted ? "aborted" : "error";
-				queryCtx.turnOutput.errorMessage ??= errorMessage(error);
+				queryCtx.turnOutput.errorMessage ??= message;
 				endCurrentPiStream(queryCtx, { type: "error", reason: wasAborted ? "aborted" : "error", error: queryCtx.turnOutput });
 			}
 		};
