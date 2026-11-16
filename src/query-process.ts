@@ -40,15 +40,15 @@ export class QueryProcess {
 		child.once("close", () => this.resolveExit());
 		return child;
 	};
-	/** What was run and how, plus its stderr tail, for an error message about the process exiting. */
+	/** What was run and how, plus its stderr tail, on one line (newlines become " | "), for an error message about
+	 *  the process exiting. */
 	describe(): string {
-		if (!this.launch) return "\nClaude Code was not spawned.";
+		if (!this.launch) return "Claude Code was not spawned";
 		const { command, args, cwd } = this.launch;
 		const shown = args.map((a) => ARG_CHARS < a.length ? `<${a.length} chars>`
 			: /^[\w@%+=:,./-]+$/.test(a) ? a : JSON.stringify(a));
-		const stderr = this.stderrTail.trim();
-		return `\nRan: ${command} ${shown.join(" ")}\nIn: ${cwd ?? process.cwd()}`
-			+ (stderr ? `\nStderr:\n${stderr}` : "\nStderr: empty");
+		const stderr = this.stderrTail.trim().replace(/\s*\r?\n\s*/g, " | ");
+		return `ran: ${command} ${shown.join(" ")}; in: ${cwd ?? process.cwd()}; stderr: ${stderr || "empty"}`;
 	}
 	/** A query constructor can throw after spawning, before returning a handle. */
 	terminate(): void {

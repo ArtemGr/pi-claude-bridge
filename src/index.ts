@@ -421,13 +421,16 @@ async function reportHeldRateLimit(c: QueryContext, model: Model<any>): Promise<
 	}
 }
 
-/** `context` must already be in bridge shape (toBridgeContext). */
 /** The SDK reports a dead child only as "Claude Code process exited with code N" (or "terminated by signal"),
- *  so append what was run and its stderr, because a broken wrapper or missing binary is otherwise invisible. */
+ *  so append what was run and its stderr, because a broken wrapper or missing binary is otherwise invisible.
+ *  It stays one line, because pi-bolt kept only the first line of a multi-line one, plus "..." (a session stored
+ *  "Claude Code process exited with code 1..."); the SDK's message ends in a newline, so it is trimmed as well. */
 function withExitDetails(message: string, child: QueryProcess | undefined): string {
-	return child && /Claude Code process (exited|terminated)/.test(message) ? message + child.describe() : message;
+	return child && /Claude Code process (exited|terminated)/.test(message)
+		? `${message.trim()}; ${child.describe()}` : message;
 }
 
+/** `context` must already be in bridge shape (toBridgeContext). */
 function isolatedStreamFn(model: Model<any>, context: Context, options?: SimpleStreamOptions, traceCallId?: string): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
 	void runIsolatedSummary(model, context, options, stream, traceCallId);
