@@ -54,8 +54,9 @@ function messageShape(message: { role: string; content?: unknown } | undefined):
 		: typeof message.content === "string" ? `string:${message.content.length}` : typeof message.content;
 	return { role: message.role, content, provider: (message as any).provider ?? null };
 }
+// Created 0600 (mode applies on creation only), because /dev/shm is world-readable and rows carry session ids and cwds.
 function usageTrace(kind: string, fields: Record<string, unknown>): void {
-	try { appendFileSync(USAGE_TRACE_PATH, `${JSON.stringify({ t: new Date().toISOString(), kind, ...fields })}\n`); }
+	try { appendFileSync(USAGE_TRACE_PATH, `${JSON.stringify({ t: new Date().toISOString(), kind, ...fields })}\n`, { mode: 0o600 }); }
 	catch (error) { debug(`usageTrace: append failed:`, error); }
 }
 /** The 5m/1h split shows which TTL each cache write is billed at (a 1h write costs 2x input, a 5m write 1.25x). */
@@ -69,7 +70,7 @@ function cacheWriteSplit(usage: unknown): { write5m: number | null; write1h: num
 // costs. CLAUDE_BRIDGE_TOK_LOG overrides the path.
 const TOK_LOG_PATH = process.env.CLAUDE_BRIDGE_TOK_LOG ?? "/dev/shm/claude-bridge-tok.jsonl";
 function tokLog(kind: string, fields: Record<string, unknown>): void {
-	try { appendFileSync(TOK_LOG_PATH, `${JSON.stringify({ t: new Date().toISOString(), kind, ...fields })}\n`); }
+	try { appendFileSync(TOK_LOG_PATH, `${JSON.stringify({ t: new Date().toISOString(), kind, ...fields })}\n`, { mode: 0o600 }); }
 	catch (error) { debug(`tokLog: append failed:`, error); }
 }
 /** One row per usage report; message_start and message_delta report the same API call with cumulative counters,
