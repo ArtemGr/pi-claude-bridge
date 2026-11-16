@@ -9,7 +9,10 @@ export class QueryProcess {
 	private closed = false;
 	private resolveExit!: () => void;
 	readonly exited = new Promise<void>((resolve) => { this.resolveExit = resolve; });
-	constructor(private stderr?: (data: string) => void) {}
+	constructor(
+		private stderr?: (data: string) => void,
+		private onSpawn?: (options: SpawnOptions, pid: number | undefined) => void,
+	) {}
 	spawn = (options: SpawnOptions): SpawnedProcess => {
 		if (this.closed || this.started) throw new Error("Query process spawned after close or more than once");
 		const child = spawn(options.command, options.args, {
@@ -19,6 +22,7 @@ export class QueryProcess {
 		// Only a returned child can close; a synchronous spawn failure leaves none.
 		this.started = true;
 		this.child = child;
+		this.onSpawn?.(options, child.pid);
 		child.stderr.on("data", (data: Buffer) => this.stderr?.(data.toString()));
 		child.once("close", () => this.resolveExit());
 		return child;

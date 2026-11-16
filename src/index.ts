@@ -1,7 +1,9 @@
 import { createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEvent, type AssistantMessageEventStream, type Context, type ImageContent, type Model, type SimpleStreamOptions, type TextContent, type Tool, type UserMessage } from "@earendil-works/pi-ai";
 import { getModels } from "@earendil-works/pi-ai/compat";
 import { isToolCallEventType, VERSION as PI_VERSION, type ExtensionAPI, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import { query, type EffortLevel, type SDKMessage, type SettingSource, type ThinkingConfig } from "@anthropic-ai/claude-agent-sdk";
+import {
+	query, type EffortLevel, type SDKMessage, type SettingSource, type SpawnOptions, type ThinkingConfig,
+} from "@anthropic-ai/claude-agent-sdk";
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { createSession, deleteSession, getSessionPath } from "cc-session-io";
 import { createHash, randomUUID } from "node:crypto";
@@ -53,6 +55,39 @@ function messageShape(message: { role: string; content?: unknown } | undefined):
 function usageTrace(kind: string, fields: Record<string, unknown>): void {
 	try { appendFileSync(USAGE_TRACE_PATH, `${JSON.stringify({ t: new Date().toISOString(), kind, ...fields })}\n`); }
 	catch (error) { debug(`usageTrace: append failed:`, error); }
+}
+/** The 5m/1h split shows which TTL each cache write is billed at (a 1h write costs 2x input, a 5m write 1.25x). */
+function cacheWriteSplit(usage: unknown): { write5m: number | null; write1h: number | null } {
+	const split = (usage as any)?.cache_creation as
+		{ ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number } | undefined;
+	return { write5m: split?.ephemeral_5m_input_tokens ?? null, write1h: split?.ephemeral_1h_input_tokens ?? null };
+}
+// Long-term token accounting, separate from the investigation trace above: per-call tokens ("tok" rows) and the plan
+// windows' utilization ("rate-limit" rows), so a script (acp-cc's cc_sub.mjs) can estimate what a subscription percent
+// costs. CLAUDE_BRIDGE_TOK_LOG overrides the path.
+const TOK_LOG_PATH = process.env.CLAUDE_BRIDGE_TOK_LOG ?? "/dev/shm/claude-bridge-tok.jsonl";
+function tokLog(kind: string, fields: Record<string, unknown>): void {
+	try { appendFileSync(TOK_LOG_PATH, `${JSON.stringify({ t: new Date().toISOString(), kind, ...fields })}\n`); }
+	catch (error) { debug(`tokLog: append failed:`, error); }
+}
+/** One row per usage report; message_start and message_delta report the same API call with cumulative counters,
+ *  so a reader keeps the largest value per apiMessageId. */
+function tokUsage(model: string, source: string, apiMessageId: string | null, usage: any): void {
+	tokLog("tok", {
+		model, source, apiMessageId, in: usage?.input_tokens ?? 0, out: usage?.output_tokens ?? 0,
+		cr: usage?.cache_read_input_tokens ?? 0, cw: usage?.cache_creation_input_tokens ?? 0, ...cacheWriteSplit(usage),
+	});
+}
+/** Claude Code's rate_limit_event as is: its unifiedWindows carry the five_hour and seven_day utilization. */
+function rateLimitTrace(info: unknown, fields: Record<string, unknown>): void {
+	tokLog("rate-limit", { ...fields, info: info ?? null });
+}
+/** Records what the SDK actually launched, so a wrapper set as provider.pathToClaudeCodeExecutable shows up in
+ *  the trace. Only the first argument is kept, because later ones can carry prompts. */
+function spawnTrace(fields: Record<string, unknown>): (options: SpawnOptions, pid: number | undefined) => void {
+	return (options, pid) => usageTrace("spawn", {
+		...fields, command: options.command, arg0: options.args[0] ?? null, argc: options.args.length, pid: pid ?? null,
+	});
 }
 import { CC_CHILD_ENV, ccChildEnv, CLAUDE_MD_EXCLUDES, errorMessage, REASONING_TO_EFFORT, resultErrorText } from "./cc-child.js";
 
@@ -418,6 +453,10 @@ async function runIsolatedSummary(
 		// Honour the caller's reasoning level, same mapping as the provider path.
 		const effort = effortForReasoning(model, options?.reasoning);
 		const thinking = thinkingForReasoning(model, options?.reasoning);
+		const cliDebug = makeCliDebugOptions("compact-summary");
+		// a custom spawn, as on the provider path, so the summary's Claude Code process is traced too
+		const childProcess = new QueryProcess(
+			cliDebug.stderr, spawnTrace({ source: "isolated-summary", queryId: traceQueryId, callId: traceCallId ?? null }));
 		debug(`compact summary: spawn model=${cliModel} registeredModel=${model.id} effort=${effort ?? "default"}${thinking ? " thinking=disabled" : ""} promptLen=${promptText.length}`);
 
 		sdkQuery = queryImpl({
@@ -437,7 +476,8 @@ async function runIsolatedSummary(
 				...(effort ? { effort } : {}),
 				...(thinking ? { thinking } : {}),
 				...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
-				...makeCliDebugOptions("compact-summary"),
+				...cliDebug,
+				spawnClaudeCodeProcess: childProcess.spawn,
 			},
 		});
 
@@ -462,7 +502,12 @@ async function runIsolatedSummary(
 				for (const block of (message as any).message?.content ?? []) {
 					if (block.type === "text" && typeof block.text === "string") assistantText += block.text;
 				}
+			} else if (message.type === "rate_limit_event") {
+				rateLimitTrace((message as any).rate_limit_info, { source: "isolated-summary", queryId: traceQueryId ?? null });
 			} else if (message.type === "result") {
+				// The provider path logs tokens per API call; this path has only the run's total, so log that,
+				// because a summary of a long session is a large uncached prompt that the subscription bills for.
+				if ((message as any).usage) tokUsage(cliModel, "isolated-summary", null, (message as any).usage);
 				logServedContextWindow("compact summary", message, model);
 				errorText = resultErrorText(message);
 				if (!errorText && message.subtype === "success") finalText = message.result || assistantText;
@@ -911,12 +956,11 @@ function sessionTag(piSessionId: string | null | undefined): string {
 function recordUsage(output: AssistantMessage, usage: SdkUsage, model: Model<any>, piSessionId: string | null,
 	source = "?", apiMessageId: string | undefined = undefined, queryId: string | undefined = undefined,
 	c: QueryContext | undefined = undefined): void {
-	// The 5m/1h split shows which TTL each cache write is billed at (a 1h write costs 2x input, a 5m write 1.25x).
-	const split = (usage as any).cache_creation as { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number } | undefined;
 	usageTrace("usage", {
 		source, apiMessageId: apiMessageId ?? null, queryId: queryId ?? null, piSessionId,
-		write5m: split?.ephemeral_5m_input_tokens ?? null, write1h: split?.ephemeral_1h_input_tokens ?? null, raw: usage,
+		...cacheWriteSplit(usage), raw: usage,
 	});
+	tokUsage(model.id, source, apiMessageId ?? null, usage);
 	if (source !== "synthetic" && c) {
 		const rawIters = (usage as any).iterations;
 		const iters = Array.isArray(rawIters) ? rawIters as Array<{ cache_creation_input_tokens?: number }> : [];
@@ -1693,6 +1737,7 @@ async function consumeQuery(
 		if (message.type === "rate_limit_event") {
 			const info = (message as any).rate_limit_info;
 			debug("consumeQuery: rate_limit_event", JSON.stringify(info).slice(0, 300));
+			rateLimitTrace(info, { queryId: usageQueryId(queryCtx), piSessionId: queryCtx.piSessionId });
 			if (info) queryCtx.heldRateLimit = info;
 			await reportHeldRateLimit(queryCtx, model);
 			if (wasAborted() || queryCtx.discarded) break;
@@ -2212,7 +2257,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			signal: traceSignalId(options?.signal), digests: { systemPrompt: systemPromptText }, systemPromptPreset: providerSettings.systemPromptPreset ?? null,
 		}, ccChildEnv(options?.env));
 		const cliDebug = makeCliDebugOptions("provider");
-		const childProcess = new QueryProcess(cliDebug.stderr);
+		const childProcess = new QueryProcess(
+			cliDebug.stderr, spawnTrace({ source: "provider", queryId: usageQueryId(queryCtx), piSessionId }));
 		const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 			cwd,
 			env: childEnv,
