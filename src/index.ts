@@ -2246,7 +2246,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			queryId: usageQueryId(queryCtx), piSessionId, reentrant: isReentrant, resume: resumeSessionId ?? null,
 			target: syncResult.targetSessionId, created: syncResult.created, forkAt: syncResult.forkAt ?? null, model: cliModel,
 			effort: effort ?? null, msgs: context.messages.length, historyRewritten, unparkedToolResult,
-			promptDigest: promptDigest.slice(0, 12), appendChars: systemPromptAppend?.length ?? 0,
+			promptDigest: promptDigest.slice(0, 12), promptChars: systemPromptText?.length ?? 0,
 			tools: createHash("sha256").update(JSON.stringify(mcpTools.map((t) => [t.name, t.description, t.parameters])))
 				.digest("hex").slice(0, 12),
 			prompt: promptText.slice(0, 80),
