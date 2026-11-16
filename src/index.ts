@@ -473,7 +473,8 @@ async function runIsolatedSummary(
 			prompt: promptText,
 			options: {
 				cwd,
-				env: traceQueryStart(traceQueryId, { kind: "isolated-summary", callId: traceCallId, model: cliModel }, ccChildEnv(options?.env)),
+				env: traceQueryStart(traceQueryId, { kind: "isolated-summary", callId: traceCallId, model: cliModel },
+					ccChildEnv(options?.env, undefined, warnRootSandbox)),
 				settings: { autoMemoryEnabled: false },
 				tools: [],
 				strictMcpConfig: true,
@@ -860,6 +861,16 @@ const activeQueryContexts = new Set<QueryContext>();
 // Whoever had the old askClaude setting on lost the tool on upgrade. Warned at most once
 // per module instance, which pi's per-session reruns of the factory below share.
 let askClaudeWarningShown = false;
+
+// Running as root makes ccChildEnv set IS_SANDBOX=1 for Claude Code; warned once per module instance.
+let rootSandboxWarningShown = false;
+function warnRootSandbox(): void {
+	if (rootSandboxWarningShown) return;
+	rootSandboxWarningShown = true;
+	piUI?.notify("Claude bridge: pi runs as root, and Claude Code refuses bypassPermissions as root, so the bridge sets "
+		+ "IS_SANDBOX=1 for it (which also makes it keep retrying 529 overloads). Run pi as a regular user to avoid this.",
+		"warning");
+}
 
 /** Close every query a shutting-down pi session still holds, keeping its progress
  *  for a later resume. Scoped to that session: subagents run in the parent's
@@ -2265,7 +2276,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			kind: "provider", callId: traceCallId, piSessionId, reentrant: isReentrant, resume: resumeSessionId ?? null,
 			model: cliModel, effort: effort ?? null, servedToolNames: Object.fromEntries(customToolNameToSdk), mcpTools: mcpTools.map((t) => t.name),
 			signal: traceSignalId(options?.signal), digests: { systemPrompt: systemPromptText }, systemPromptPreset: providerSettings.systemPromptPreset ?? null,
-		}, ccChildEnv(options?.env));
+		}, ccChildEnv(options?.env, undefined, warnRootSandbox));
 		const cliDebug = makeCliDebugOptions("provider");
 		const childProcess = new QueryProcess(
 			cliDebug.stderr, spawnTrace({ source: "provider", queryId: usageQueryId(queryCtx), piSessionId }));

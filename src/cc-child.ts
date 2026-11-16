@@ -63,7 +63,15 @@ const SESSION_STORAGE_VARS = ["CLAUDE_CONFIG_DIR", "HOME", "USERPROFILE"];
 // is pi's per-request provider env (a stored credential's `env`, or the caller's), which
 // takes precedence over process.env; an empty value removes the variable, since pi's
 // auth.json only allows strings. CC_CHILD_ENV goes last so its guards always hold.
-export function ccChildEnv(overrides: Record<string, string> = {}, parent: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+//
+// As root, Claude Code exits on bypassPermissions ("--dangerously-skip-permissions cannot
+// be used with root/sudo privileges") unless IS_SANDBOX=1 or CLAUDE_CODE_BUBBLEWRAP is
+// set. The bridge gives it no built-in tools, so pi's own tool checks still apply, hence
+// IS_SANDBOX=1 is set for the child only, and `onRootSandbox` lets the caller warn. Besides
+// the root check, IS_SANDBOX makes CC (2.1.321) keep retrying repeated 529 overloads.
+export function ccChildEnv(
+	overrides: Record<string, string> = {}, parent: NodeJS.ProcessEnv = process.env, onRootSandbox?: () => void,
+): NodeJS.ProcessEnv {
 	const storage = Object.keys(overrides).filter((name) => SESSION_STORAGE_VARS.includes(name.toUpperCase()));
 	if (storage.length) throw new Error(`claude-bridge: provider env can't set ${storage.join(", ")}; the bridge reads Claude Code's session files through pi's own values`);
 	const env: NodeJS.ProcessEnv = { ...parent };
@@ -71,6 +79,10 @@ export function ccChildEnv(overrides: Record<string, string> = {}, parent: NodeJ
 	for (const [name, value] of Object.entries(overrides)) {
 		if (value === "") delete env[name];
 		else env[name] = value;
+	}
+	if (process.getuid?.() === 0 && env.IS_SANDBOX !== "1" && !env.CLAUDE_CODE_BUBBLEWRAP) {
+		env.IS_SANDBOX = "1";
+		onRootSandbox?.();
 	}
 	return { ...env, ...CC_CHILD_ENV };
 }
