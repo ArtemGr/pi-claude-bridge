@@ -34,7 +34,9 @@ import { DEBUG, debug, makeCliDebugOptions, moduleInstanceId } from "./debug.js"
 
 // Local tracing for the cache-rewrite / misreported-usage investigation: always on, because a
 // quota-capped window leaves too few turns to rerun with env flags. CLAUDE_BRIDGE_USAGE_TRACE overrides the path.
-const USAGE_TRACE_PATH = process.env.CLAUDE_BRIDGE_USAGE_TRACE ?? "/dev/shm/bridge-trace.log";
+// One file per uid, because the first user to write creates it 0644, so another user's appends would fail.
+const USAGE_TRACE_PATH = process.env.CLAUDE_BRIDGE_USAGE_TRACE
+	?? `/dev/shm/bridge-trace${process.getuid ? `-${process.getuid()}` : ""}.log`;
 const usageQueryIds = new WeakMap<object, string>();
 let usageSeq = 0;
 /** A per-query id for usageTrace; traceQueryId is undefined unless CLAUDE_BRIDGE_TRACE_DIR is set. */
