@@ -48,7 +48,8 @@ export class QueryProcess {
 		const shown = args.map((a) => ARG_CHARS < a.length ? `<${a.length} chars>`
 			: /^[\w@%+=:,./-]+$/.test(a) ? a : JSON.stringify(a));
 		const stderr = this.stderrTail.trim().replace(/\s*\r?\n\s*/g, " | ");
-		return `ran: ${command} ${shown.join(" ")}; in: ${cwd ?? process.cwd()}; stderr: ${stderr || "empty"}`;
+		// stderr first, because it says why, and pi-bolt shows only the start of a long error
+		return `stderr: ${stderr || "empty"}; in: ${cwd ?? process.cwd()}; ran: ${command} ${shown.join(" ")}`;
 	}
 	/** A query constructor can throw after spawning, before returning a handle. */
 	terminate(): void {
