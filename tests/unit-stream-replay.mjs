@@ -49,11 +49,12 @@ function cycles(messages) {
 
 /** Replays a fixture through the real consumeQuery, collecting the pi-side events.
  *  With `cycle`, replays just that cycle, as the turn it would be; with `provider`, as
- *  that provider's turn. */
-async function replay(name, { cycle, provider = model.provider } = {}) {
+ *  that provider's turn; with `id`, as that model's turn, because the bridge aborts a turn
+ *  served by a model other than the one requested. */
+async function replay(name, { cycle, provider = model.provider, id = model.id } = {}) {
 	const events = [];
 	const c = new QueryContext();
-	const turnModel = { ...model, provider };
+	const turnModel = { ...model, provider, id };
 	c.currentPiStream = { push: (e) => events.push(e), end: () => events.push({ type: "end" }) };
 	c.resetTurnState(turnModel);
 	// The map the provider path builds from the served tool list: SDK name → pi name.
@@ -173,7 +174,8 @@ describe("replaying recorded progress updates", () => {
 		.flatMap((m) => m.message.content.map((b, i) => ({ ...b, ccNarration: m.narration_block_indexes?.includes(i) ?? false }))));
 	const isProgressUpdate = (b) => b.ccNarration && b.thinking.trim() !== "";
 	// As the bridge's own turn: its provider decides which signed blocks go back to the API.
-	const replayCycle = (cycle) => replay("narration", { cycle, provider: "claude-bridge" });
+	// As the model that recorded it, since a served model other than the requested one aborts the turn.
+	const replayCycle = (cycle) => replay("narration", { cycle, provider: "claude-bridge", id: "claude-sonnet-5-5" });
 
 	it("has progress updates to replay", () => {
 		assert.ok(recorded.flat().filter(isProgressUpdate).length >= 2,
