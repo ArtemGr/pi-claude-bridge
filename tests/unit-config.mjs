@@ -97,6 +97,16 @@ describe("loadConfig", () => {
 		writeFileSync(join(getAgentDir(), "claude-bridge.json"), JSON.stringify({ provider: { systemPromptPreset: true } }));
 		assert.throws(() => loadConfig(), /systemPromptPreset must be "claude_code"/);
 	}));
+
+	it("keeps builtinTools and rejects anything but an array of strings", () => withTempHome(() => {
+		mkdirSync(getAgentDir(), { recursive: true });
+		writeFileSync(join(getAgentDir(), "claude-bridge.json"), JSON.stringify({ provider: { builtinTools: ["WebSearch"] } }));
+		assert.deepEqual(loadConfig().provider?.builtinTools, ["WebSearch"]);
+		for (const bad of ["WebSearch", [1], {}]) {
+			writeFileSync(join(getAgentDir(), "claude-bridge.json"), JSON.stringify({ provider: { builtinTools: bad } }));
+			assert.throws(() => loadConfig(), /builtinTools must be an array/, JSON.stringify(bad));
+		}
+	}));
 });
 
 describe("the old askClaude setting", () => {

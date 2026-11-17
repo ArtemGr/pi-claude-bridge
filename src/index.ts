@@ -800,12 +800,13 @@ export const __test = {
 
 // --- Provider helpers: tool name mapping ---
 
-// Provider path: the query runs with `tools: []`, so the only tools CC can
-// legitimately call are the pi tools we serve over MCP. Any other name is the
-// model hallucinating a builtin (`bash`, `Bash`, `Edit`, an MCP server we don't
-// serve). CC answers those itself with "No such tool available" and retries
-// inside the same query, never dispatching them to our MCP server — so a tool
-// call under such a name must not reach pi. Forwarding one ran a tool CC never
+// Provider path: the query runs with only the builtins in provider.builtinTools
+// (none by default), so pi's tools reach CC only over our MCP server. Any other
+// name is either one of those builtins, which CC runs itself inside the same
+// query, or the model hallucinating a builtin (`bash`, `Bash`, `Edit`, an MCP
+// server we don't serve), which CC answers with "No such tool available" and
+// retries. Neither is dispatched to our MCP server — so a tool call under such
+// a name must not reach pi. Forwarding one ran a tool CC never
 // dispatched (real side effects) and, because the retry carries a fresh
 // tool_use id, left the handler for the retry with no result to release it:
 // pi's result arrived keyed to the dead id, and both sides deadlocked.
@@ -2273,6 +2274,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			promptDigest: promptDigest.slice(0, 12), promptChars: systemPromptText?.length ?? 0,
 			tools: createHash("sha256").update(JSON.stringify(mcpTools.map((t) => [t.name, t.description, t.parameters])))
 				.digest("hex").slice(0, 12),
+			builtinTools: providerSettings.builtinTools ?? [],
 			prompt: promptText.slice(0, 80),
 		});
 		const childEnv = traceQueryStart(traceQueryId, {
@@ -2286,7 +2288,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		const queryOptions: NonNullable<Parameters<typeof query>[0]["options"]> = {
 			cwd,
 			env: childEnv,
-			tools: [],
+			tools: providerSettings.builtinTools ?? [],
 			permissionMode: "bypassPermissions",
 			includePartialMessages: true,
 			// User settings only. A repo's .claude/settings.json and settings.local.json can
@@ -2301,7 +2303,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			// diag/probe-git-cache.mjs). The bridge re-invokes CC per turn, so this
 			// hit on every transition. Cost here is nil: the setting also strips
 			// CC's git-workflow guidance from its Bash tool prompt, but the provider
-			// path runs CC with `tools: []`, so those definitions never ship.
+			// path runs CC without Bash unless provider.builtinTools turns it on.
 			settings: {
 				...claudeCodeSettings(providerSettings),
 				claudeMdExcludes: CLAUDE_MD_EXCLUDES,

@@ -32,6 +32,10 @@ export interface Config {
 		// off, making pi's prompt the whole system prompt. Any other value is a startup
 		// error. Loaded config holds "claude_code" when on and omits the key when off.
 		systemPromptPreset?: "claude_code" | false | null;
+		// Claude Code's own tools (e.g. "WebSearch", "WebFetch") to turn on beside pi's.
+		// Claude Code runs them inside the query and pi never sees their calls or results.
+		// Unset means none; anything but an array of strings is a startup error.
+		builtinTools?: string[];
 	};
 }
 
@@ -58,6 +62,10 @@ export function loadConfig(): Config {
 	const preset = global.provider?.systemPromptPreset as unknown;
 	if (preset !== undefined && preset !== null && preset !== false && preset !== "claude_code") {
 		throw new Error(`claude-bridge: provider.systemPromptPreset must be "claude_code" or unset (on), or false/null (off), got ${JSON.stringify(preset)}`);
+	}
+	const builtinTools = global.provider?.builtinTools as unknown;
+	if (builtinTools !== undefined && !(Array.isArray(builtinTools) && builtinTools.every((name) => typeof name === "string"))) {
+		throw new Error(`claude-bridge: provider.builtinTools must be an array of Claude Code tool names, got ${JSON.stringify(builtinTools)}`);
 	}
 	// Normalize unset to "claude_code" and false/null to absent so each state hashes one way.
 	const provider = { ...global.provider };
