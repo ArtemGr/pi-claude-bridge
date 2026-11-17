@@ -7,7 +7,7 @@ import {
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { createSession, deleteSession, getSessionPath } from "cc-session-io";
 import { createHash, randomUUID } from "node:crypto";
-import { appendFileSync, mkdirSync, readFileSync, realpathSync, statSync } from "fs";
+import { appendFileSync, constants as fsConstants, mkdirSync, readFileSync, realpathSync, statSync } from "fs";
 import { dirname } from "path";
 import { PROVIDER_ID, messageContentToText } from "./convert.js";
 import { NARRATION_HOLD_CHARS, isNarrationBlock } from "./narration.js";
@@ -69,9 +69,12 @@ function cacheWriteSplit(usage: unknown): { write5m: number | null; write1h: num
 // Long-term token accounting, separate from the investigation trace above: per-call tokens ("tok" rows) and the plan
 // windows' utilization ("rate-limit" rows), so a script (acp-cc's cc_sub.mjs) can estimate what a subscription percent
 // costs. CLAUDE_BRIDGE_TOK_LOG overrides the path.
+// Root only appends to a log that exists: a log root created (0600) would lock out the user it belongs to.
 const TOK_LOG_PATH = process.env.CLAUDE_BRIDGE_TOK_LOG ?? "/dev/shm/claude-bridge-tok.jsonl";
+const TOK_LOG_FLAG = process.getuid?.() === 0 ? fsConstants.O_WRONLY | fsConstants.O_APPEND : "a";
 function tokLog(kind: string, fields: Record<string, unknown>): void {
-	try { appendFileSync(TOK_LOG_PATH, `${JSON.stringify({ t: new Date().toISOString(), kind, ...fields })}\n`, { mode: 0o600 }); }
+	const line = `${JSON.stringify({ t: new Date().toISOString(), kind, ...fields })}\n`;
+	try { appendFileSync(TOK_LOG_PATH, line, { mode: 0o600, flag: TOK_LOG_FLAG }); }
 	catch (error) { debug(`tokLog: append failed:`, error); }
 }
 /** One row per usage report; message_start and message_delta report the same API call with cumulative counters,
