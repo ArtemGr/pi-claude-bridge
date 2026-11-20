@@ -7,8 +7,13 @@ import {
 import type { Base64ImageSource, ContentBlockParam } from "@anthropic-ai/sdk/resources";
 import { createSession, deleteSession, getSessionPath } from "cc-session-io";
 import { createHash, randomUUID } from "node:crypto";
-import { appendFileSync, constants as fsConstants, mkdirSync, readFileSync, realpathSync, statSync } from "fs";
-import { dirname } from "path";
+import {
+	appendFileSync, closeSync, constants as fsConstants, fstatSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync,
+	statSync, writeSync,
+} from "fs";
+import { homedir } from "os";
+import { dirname, join } from "path";
+import { constants as zlibConstants, createZstdCompress, type ZstdCompress } from "zlib";
 import { PROVIDER_ID, messageContentToText } from "./convert.js";
 import { NARRATION_HOLD_CHARS, isNarrationBlock } from "./narration.js";
 import { QueryProcess } from "./query-process.js";
@@ -69,13 +74,72 @@ function cacheWriteSplit(usage: unknown): { write5m: number | null; write1h: num
 // Long-term token accounting, separate from the investigation trace above: per-call tokens ("tok" rows) and the plan
 // windows' utilization ("rate-limit" rows), so a script (acp-cc's cc_sub.mjs) can estimate what a subscription percent
 // costs. CLAUDE_BRIDGE_TOK_LOG overrides the path.
-// Root only appends to a log that exists: a log root created (0600) would lock out the user it belongs to.
-const TOK_LOG_PATH = process.env.CLAUDE_BRIDGE_TOK_LOG ?? "/dev/shm/claude-bridge-tok.jsonl";
-const TOK_LOG_FLAG = process.getuid?.() === 0 ? fsConstants.O_WRONLY | fsConstants.O_APPEND : "a";
+// The log lives outside /dev/shm because a reboot clears that, and is created 0600 because rows carry session ids
+// and cwds. Its name has the uid, so one rsync call pulls the logs of several users into one folder.
+// It is zstd, one frame per process: each row is flushed (ZSTD_e_flush) to disk at once, and the process's later
+// rows still reference its earlier ones; a frame per row came out 4.7x larger (276 vs 58 KiB for 355 KiB of rows).
+// An empty last block after each row keeps the frame ended, so `zstd -d` reads the file at any moment, and the
+// process's next row overwrites that block. The frame has no checksum, because the empty last block has none.
+// When another process appended meanwhile, the row starts a new frame. Node 22 decodes only a buffer's first frame,
+// so a reader there loops over the frames (cc_sub.mjs).
+const TOK_LOG_PATH = process.env.CLAUDE_BRIDGE_TOK_LOG
+	?? join(homedir(), ".local", "share", "acp-cc", `claude-bridge-tok-${process.getuid?.() ?? 0}.jsonl.zst`);
+const TOK_LOG_END = Buffer.from([1, 0, 0]);  // a block header: last block, raw, 0 bytes
+const TOK_LOG_LOCK_STALE_MS = 10_000;  // a lock this old was left by a killed process
+/** The process's open frame; `end` is the file size after its latest row, -1 before its first. */
+let tokFrame: { zstd: ZstdCompress; out: Buffer[]; end: number } | undefined;
+/** Rows go one at a time, because a row that finds another process's frame at the end restarts our frame. */
+let tokQueue = Promise.resolve();
 function tokLog(kind: string, fields: Record<string, unknown>): void {
 	const line = `${JSON.stringify({ t: new Date().toISOString(), kind, ...fields })}\n`;
-	try { appendFileSync(TOK_LOG_PATH, line, { mode: 0o600, flag: TOK_LOG_FLAG }); }
-	catch (error) { debug(`tokLog: append failed:`, error); }
+	tokQueue = tokQueue.then(() => tokAppend(line)).catch((error) => debug(`tokLog: append failed:`, error));
+}
+function tokFrameNew(): NonNullable<typeof tokFrame> {
+	const zstd = createZstdCompress({
+		params: { [zlibConstants.ZSTD_c_compressionLevel]: 6, [zlibConstants.ZSTD_c_checksumFlag]: 0 },
+	});
+	const frame = { zstd, out: [] as Buffer[], end: -1 };
+	zstd.on("data", (chunk: Buffer) => frame.out.push(chunk));
+	return frame;
+}
+async function tokAppend(line: string): Promise<void> {
+	const frame = tokFrame ??= tokFrameNew();
+	const blocks = await new Promise<Buffer>((resolve) => {
+		frame.zstd.write(line);
+		frame.zstd.flush(zlibConstants.ZSTD_e_flush, () => resolve(Buffer.concat(frame.out.splice(0))));
+	});
+	const written = tokLocked(() => {
+		// Not O_APPEND, because Linux ignores writeSync's position under it
+		const rw = openSync(TOK_LOG_PATH, fsConstants.O_RDWR | fsConstants.O_CREAT, 0o600);
+		try {
+			const size = fstatSync(rw).size;
+			if (frame.end !== -1 && frame.end !== size) return false;  // another process appended since our latest row
+			const at = frame.end === -1 ? size : size - TOK_LOG_END.length;
+			const data = Buffer.concat([blocks, TOK_LOG_END]);
+			writeSync(rw, data, 0, data.length, at);
+			frame.end = at + data.length;
+			return true;
+		} finally { closeSync(rw); }
+	});
+	if (written) return;
+	// Our frame's later blocks would reference this row, which never reached the file, so the row starts a new frame.
+	frame.zstd.close();
+	tokFrame = undefined;
+	return tokAppend(line);
+}
+/** Runs `write` holding `<log>.lock`, because a row's check of the file size and its write must not interleave with
+ *  another process's. */
+function tokLocked<T>(write: () => T): T {
+	const lock = `${TOK_LOG_PATH}.lock`;
+	mkdirSync(dirname(lock), { recursive: true, mode: 0o700 });
+	for (;;) {
+		try { closeSync(openSync(lock, "wx", 0o600)); break; }
+		catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+		const age = Date.now() - (statSync(lock, { throwIfNoEntry: false })?.mtimeMs ?? Date.now());
+		if (TOK_LOG_LOCK_STALE_MS < age) rmSync(lock, { force: true });
+		else Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
+	}
+	try { return write(); } finally { rmSync(lock, { force: true }); }
 }
 /** One row per usage report; message_start and message_delta report the same API call with cumulative counters,
  *  so a reader keeps the largest value per apiMessageId. */
