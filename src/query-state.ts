@@ -112,6 +112,10 @@ export class QueryContext {
 	 */
 	historyStale = false;
 
+	/** Compact-fork summary call (`x-pi-bridge-compact: fork`): must not invoke tools,
+	 *  and must leave the live CC session untouched. */
+	compactFork = false;
+
 	// Per-turn (reset together)
 	turnOutput: AssistantMessage | null = null;
 	turnStarted = false;

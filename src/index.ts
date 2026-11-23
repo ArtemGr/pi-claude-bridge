@@ -1809,7 +1809,15 @@ async function consumeQuery(
 			const started = (message as any).event.message;
 			traceEvent("api-message", { queryId: traceQueryId, apiMessageId: started?.id ?? null, model: started?.model ?? null, usage: started?.usage ?? null });
 		}
-		const abortReason = detectFallbackOrRefusal(message, model);
+		// A compact-fork summary keeps MCP tools declared only so the tool-schema prefix hits the
+		// prompt cache; if the model disobeys NO_TOOLS, abort instead of parking for a tool result.
+		const compactToolAbort = queryCtx.compactFork && (
+			(message.type === "stream_event" && (message as any).event?.type === "content_block_start"
+				&& (message as any).event?.content_block?.type === "tool_use")
+			|| (message.type === "assistant" && Array.isArray((message as any).message?.content)
+				&& (message as any).message.content.some((b: any) => b?.type === "tool_use"))
+		) ? "Claude bridge compact fork attempted a tool call despite NO_TOOLS" : undefined;
+		const abortReason = detectFallbackOrRefusal(message, model) ?? compactToolAbort;
 		if (abortReason !== undefined) {
 			const qid = usageQueryId(queryCtx);
 			if (queryCtx.turnOutput) {
@@ -2129,7 +2137,8 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		return isolatedStreamFn(model, context, options, traceCallId);
 	}
 
-	if (options?.sessionId) noticeDroppedTurn(options.sessionId, context.messages);
+	const compactFork = options?.headers?.["x-pi-bridge-compact"] === "fork";
+	if (options?.sessionId && !compactFork) noticeDroppedTurn(options.sessionId, context.messages);
 
 	const stream = createAssistantMessageEventStream();
 	// Report a failure before any query exists on the stream, as pi-ai's provider
@@ -2255,8 +2264,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 
 	// A fresh request replaces a parked query of this same pi session. Its
 	// synchronous progress commit happens before sync takes a state identity.
+	// Compact-fork leaves parked queries alone (compaction runs while idle anyway).
 	try {
-		if (options?.sessionId) for (const parked of [...activeQueryContexts]) {
+		if (options?.sessionId && !compactFork) for (const parked of [...activeQueryContexts]) {
 			if (parked.piSessionId === options.sessionId) discardRewrittenQuery(parked);
 		}
 	} catch (error) { return failBeforeQuery(error); }
@@ -2284,6 +2294,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const systemPromptText = context.systemPrompt;
 
 	queryCtx.piSessionId = options?.sessionId ?? null;
+	queryCtx.compactFork = compactFork;
 	queryCtx.resetTurnState(model);
 	claimCurrentPiStream(stream, "fresh-query", queryCtx, options);
 	activeQueryContexts.add(queryCtx);
@@ -2303,13 +2314,39 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		const piSessionId = options?.sessionId ?? null;
 		// Read before the consume below: with no query parked (an overflow retried
 		// after compaction), the session's mark is the only sign of the rewrite.
-		const historyRewritten = rewrittenUnderQuery || (piSessionId !== null && historyRewrittenBySession.has(piSessionId));
+		const historyRewritten = !compactFork
+			&& (rewrittenUnderQuery || (piSessionId !== null && historyRewrittenBySession.has(piSessionId)));
 		const promptDigest = createHash("sha256").update(JSON.stringify([providerSettings.systemPromptPreset ?? null, systemPromptText ?? ""])).digest("hex");
-		const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, cliModel, piSessionId, traceCallId, promptDigest);
+		let syncResult: SyncResult;
+		if (compactFork) {
+			// Cached compaction fork (F11 / /compact from pi-compact-ag): fork the live CC session
+			// directly without comparing priors against buildSessionContext (which is unpaged while
+			// state.ccSessionId holds the paged window that sits in Anthropic's 5m cache).
+			const state = sessionStateFor(piSessionId);
+			if (!state) throw new Error("no live Claude Code session to fork");
+			statSync(getSessionPath(state.ccSessionId, state.cwd, process.env.CLAUDE_CONFIG_DIR));
+			if (safeRealpath(state.cwd) !== safeRealpath(cwd)) throw new Error("session cwd changed");
+			if (state.model !== cliModel) throw new Error(`session model changed (${state.model} -> ${cliModel})`);
+			if (state.promptDigest !== promptDigest) throw new Error("system prompt changed");
+			const targetSessionId = randomUUID();
+			usageTrace("sync-decision", {
+				piSessionId, row: 4, path: "compact-fork", reason: "compact-fork",
+				ccSessionBefore: state.ccSessionId, ccSessionAfter: targetSessionId,
+				recorded: state.digests.length, stateModel: state.model, modelId: cliModel,
+			});
+			traceEvent("route", { callId: traceCallId, route: "compact-fork", from: state.ccSessionId, target: targetSessionId });
+			syncResult = {
+				sessionId: state.ccSessionId, targetSessionId, created: true,
+				recorded: copyRecording(state), state,
+			};
+		} else {
+			syncResult = syncSharedSession(
+				context.messages, cwd, customToolNameToSdk, cliModel, piSessionId, traceCallId, promptDigest);
+		}
 		if (syncResult.created) createdBeforeLaunch = { id: syncResult.targetSessionId, cwd };
 		// This query starts from the history pi has now: consume this session's
 		// armed rewrite — a sibling pi session's stays armed for its own queries.
-		if (piSessionId) historyRewrittenBySession.delete(piSessionId);
+		if (piSessionId && !compactFork) historyRewrittenBySession.delete(piSessionId);
 		const { sessionId: resumeSessionId } = syncResult;
 		const recording = queryCtx.recording = new LiveRecording(syncResult.recorded, nonSystemMessages(context.messages));
 		const promptBlocks = extractUserPromptBlocks(context.messages);
@@ -2444,10 +2481,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			...(thinking ? { thinking } : {}),
 			...(mcpServers ? { mcpServers } : {}),
 			...(resumeSessionId ? { resume: resumeSessionId } : {}),
-			...(syncResult.forkAt ? { forkSession: true, resumeSessionAt: syncResult.forkAt } : {}),
+			...(compactFork
+				? { forkSession: true }
+				: syncResult.forkAt ? { forkSession: true, resumeSessionAt: syncResult.forkAt } : {}),
 			// --session-id names a fresh launch or a fork's target; a prewritten
 			// import resumes its own id, and CC rejects --session-id beside it.
-			...(syncResult.created && (!resumeSessionId || syncResult.forkAt) ? { sessionId: syncResult.targetSessionId } : {}),
+			...(syncResult.created && (!resumeSessionId || syncResult.forkAt || compactFork)
+				? { sessionId: syncResult.targetSessionId } : {}),
 			...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
 			...cliDebug,
 			spawnClaudeCodeProcess: childProcess.spawn,
@@ -2485,6 +2525,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		// authoritative at once; the file is saved after exit (persistRecording).
 		const commitRecording = (dirty: boolean) => {
 			stopWriting();
+			if (compactFork) return;
 			// Costs the next turn a prefix-write; diag/audit-cache.mjs fails on it.
 			if (!dirty && (recording.hasGaps || (syncResult.created && !recording.hasProgress))) debug(`recording: clean end left messages unrecorded ${sessionTag(piSessionId)}`);
 			usageTrace("commit", {
@@ -2624,8 +2665,10 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				stopWriting();
 				try { await persistRecording(); }
 				finally {
-					if (syncResult.created && !recording.hasProgress) {
-						usageTrace("delete-session", { queryId: usageQueryId(queryCtx), piSessionId, target: syncResult.targetSessionId });
+					if (compactFork || (syncResult.created && !recording.hasProgress)) {
+						usageTrace("delete-session", {
+							queryId: usageQueryId(queryCtx), piSessionId, target: syncResult.targetSessionId, compactFork,
+						});
 						deleteSession(syncResult.targetSessionId, cwd, process.env.CLAUDE_CONFIG_DIR);
 					}
 					releaseWriter();
