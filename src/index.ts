@@ -546,7 +546,9 @@ async function runIsolatedSummary(
 				cwd,
 				env: traceQueryStart(traceQueryId, { kind: "isolated-summary", callId: traceCallId, model: cliModel },
 					ccChildEnv(options?.env, undefined, warnRootSandbox)),
-				settings: { autoMemoryEnabled: false },
+				// settingSources [] skips ~/.claude/settings.json, so without promptCacheTtl here Claude Code writes the
+				// subscription default 1h cache (2x input), which this one-off prompt never reads again.
+				settings: { autoMemoryEnabled: false, promptCacheTtl: "5m" },
 				tools: [],
 				strictMcpConfig: true,
 				settingSources: [] as SettingSource[],
@@ -571,6 +573,7 @@ async function runIsolatedSummary(
 		let assistantText = "";
 		let finalText = "";
 		let errorText: string | undefined;
+		let resultUsage: SdkUsage | undefined;
 		let firstEventLogged = false;
 
 		for await (const message of sdkQuery) {
@@ -589,7 +592,12 @@ async function runIsolatedSummary(
 			} else if (message.type === "result") {
 				// The provider path logs tokens per API call; this path has only the run's total, so log that,
 				// because a summary of a long session is a large uncached prompt that the subscription bills for.
-				if ((message as any).usage) tokUsage(cliModel, "isolated-summary", null, (message as any).usage);
+				// We also keep it for the returned message, because pi sums each summary call's usage into the
+				// compaction entry; maxTurns 1 means one API call, so the run's total is that call's usage.
+				if ((message as any).usage) {
+					resultUsage = (message as any).usage;
+					tokUsage(cliModel, "isolated-summary", null, resultUsage);
+				}
 				logServedContextWindow("compact summary", message, model);
 				errorText = resultErrorText(message);
 				if (!errorText && message.subtype === "success") finalText = message.result || assistantText;
@@ -612,7 +620,9 @@ async function runIsolatedSummary(
 		}
 
 		debug(`compact summary: done textLen=${text.length}`);
-		endStream(stream, { type: "done", reason: "stop", message: newAssistantOutput(model, text, "stop") });
+		const output = newAssistantOutput(model, text, "stop");
+		if (resultUsage) updateUsage(output, resultUsage, model);
+		endStream(stream, { type: "done", reason: "stop", message: output });
 	} catch (err) {
 		const msg = withExitDetails(errorMessage(err), childProcess);
 		debug("runIsolatedSummary threw; pushing terminal error", err);
